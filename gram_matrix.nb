@@ -1,0 +1,139 @@
+(* Content-type: application/vnd.wolfram.mathematica *)
+
+(*** Wolfram Notebook File ***)
+(* http://www.wolfram.com/nb *)
+
+Notebook[{
+
+Cell["Gram Matrix \[LongDash] Effective Dimension", "Title"],
+
+Cell["Manthos Karydas", "Subtitle"],
+
+Cell["\
+Given an analytical kernel K(x,y), discretize the domain, build the Gram \
+matrix G[i,j]=K(x\[Subscript]i,x\[Subscript]j), and compute the effective \
+dimension as the number of non-negligible eigenvalues.", "Text"],
+
+(* ------------------------------------------------------------------ *)
+Cell["Setup", "Section"],
+
+Cell[BoxData[
+"Needs[\"Developer`\"]"
+], "Input"],
+
+(* ------------------------------------------------------------------ *)
+Cell["Helpers", "Section"],
+
+Cell["Convert any point list to a packed numerical (N\[Times]d) matrix.", "Text"],
+
+Cell[BoxData[
+"toMatrix[pts_] :=\n  Developer`ToPackedArray[\n    If[VectorQ[pts, NumericQ], List /@ N[pts], N[pts]]\n  ]"
+], "Input"],
+
+Cell["\
+Squared Euclidean distance matrix via the identity \
+\[DoubleVerticalBar]x\[Minus]y\[DoubleVerticalBar]\[CenterDot]\
+\[CenterDot]\[CenterDot]\[Superscript]2 = \
+\[DoubleVerticalBar]x\[DoubleVerticalBar]\[Superscript]2 + \
+\[DoubleVerticalBar]y\[DoubleVerticalBar]\[Superscript]2 \[Minus] 2 x\
+\[CenterDot]y (pure BLAS, no DistanceMatrix dependency).", "Text"],
+
+Cell[BoxData[
+"squaredDistances[p_] :=\n  Module[{norms = Total[p^2, {2}]},\n    Developer`ToPackedArray[\n      Outer[Plus, norms, norms] - 2. (p . Transpose[p])\n    ]\n  ]"
+], "Input"],
+
+Cell["L1 (Manhattan) distance matrix.", "Text"],
+
+Cell[BoxData[
+"l1Distances[p_] :=\n  Developer`ToPackedArray[\n    Total[Abs[Outer[Subtract, p, p, 1]], {3}]\n  ]"
+], "Input"],
+
+(* ------------------------------------------------------------------ *)
+Cell["Kernel Functions", "Section"],
+
+Cell["\
+Each builder takes a list of points and returns the full N\[Times]N Gram \
+matrix using vectorized numerical operations \[LongDash] no element-wise \
+kernel calls.", "Text"],
+
+Cell["Linear:  K(x,y) = x \[CenterDot] y", "Subsection"],
+
+Cell[BoxData[
+"gramLinear[pts_] :=\n  Module[{p = toMatrix[pts]},\n    Developer`ToPackedArray[p . Transpose[p]]\n  ]"
+], "Input"],
+
+Cell["Polynomial:  K(x,y) = (x \[CenterDot] y + c)^d", "Subsection"],
+
+Cell[BoxData[
+"gramPolynomial[c_, d_][pts_] :=\n  Module[{p = toMatrix[pts]},\n    Developer`ToPackedArray[(p . Transpose[p] + c)^d]\n  ]"
+], "Input"],
+
+Cell["Gaussian:  K(x,y) = exp(\[Minus]\[DoubleVerticalBar]x\[Minus]y\[DoubleVerticalBar]\[CenterDot]\[CenterDot]\[CenterDot]\[Superscript]2 / 2\[Sigma]\[CenterDot]\[CenterDot]\[CenterDot]\[Superscript]2)", "Subsection"],
+
+Cell[BoxData[
+"gramGaussian[sigma_][pts_] :=\n  Module[{p = toMatrix[pts]},\n    Developer`ToPackedArray[Exp[-squaredDistances[p] / (2. sigma^2)]]\n  ]"
+], "Input"],
+
+Cell["Laplacian:  K(x,y) = exp(\[Minus]\[DoubleVerticalBar]x\[Minus]y\[DoubleVerticalBar]\[Subscript]1 / \[Sigma])", "Subsection"],
+
+Cell[BoxData[
+"gramLaplacian[sigma_][pts_] :=\n  Module[{p = toMatrix[pts]},\n    Developer`ToPackedArray[Exp[-l1Distances[p] / sigma]]\n  ]"
+], "Input"],
+
+Cell["Custom kernel (fallback, element-wise).", "Subsection"],
+
+Cell[BoxData[
+"gramCustom[kernel_][pts_] :=\n  Developer`ToPackedArray[N[Outer[kernel, pts, pts, 1]]]"
+], "Input"],
+
+(* ------------------------------------------------------------------ *)
+Cell["Discretize Domain", "Section"],
+
+Cell["\
+1D: domain = {a, b}.  nD: domain = {{a1,b1},{a2,b2},...}.\n\
+method: \"Grid\" (uniform) or \"Random\" (uniform random).", "Text"],
+
+Cell[BoxData[
+"discretize[domain : {_?NumericQ, _?NumericQ}, nPoints_Integer,\n           method_ : \"Grid\"] :=\n  discretize[{domain}, nPoints, method]\n\ndiscretize[domain : {{_?NumericQ, _?NumericQ} ..}, nPoints_Integer,\n           method_ : \"Grid\"] :=\n  Module[{axes, tuples},\n    Switch[method,\n      \"Grid\",\n        axes = Table[N @ Subdivide[d[[1]], d[[2]], nPoints - 1], {d, domain}];\n        tuples = Tuples[axes];\n        If[Length[domain] == 1, Flatten[tuples], tuples],\n      \"Random\",\n        Transpose[Table[RandomReal[{d[[1]], d[[2]]}, nPoints], {d, domain}]],\n      _, Message[discretize::badmethod, method]; $Failed\n    ]\n  ]\n\ndiscretize::badmethod = \"Unknown method `1`. Use \\\"Grid\\\" or \\\"Random\\\".\";"]
+, "Input"],
+
+(* ------------------------------------------------------------------ *)
+Cell["Effective Dimension", "Section"],
+
+Cell["\
+Count eigenvalues above a threshold.\n\
+  relative = True  (default): cutoff = threshold \[Times] \[Lambda]max\n\
+  relative = False: absolute cutoff\n\
+Returns {effectiveDim, eigenvalues} in descending order.", "Text"],
+
+Cell[BoxData[
+"effectiveDimension[G_?MatrixQ, threshold_ : 1*^-6, relative_ : True] :=\n  Module[{eigs, cutoff},\n    eigs   = Eigenvalues[N[G], Method -> \"LAPACK\"];\n    cutoff = If[relative, threshold * First[eigs], threshold];\n    {Count[eigs, e_ /; e > cutoff], eigs}\n  ]"
+], "Input"],
+
+(* ------------------------------------------------------------------ *)
+Cell["Example", "Section"],
+
+Cell["\
+Compare six kernels on a 50-point uniform grid over [0, 1]. Prints effective \
+dimension, largest eigenvalue, and smallest non-zero eigenvalue.", "Text"],
+
+Cell[BoxData[
+"n         = 50;\ndomain    = {0.0, 1.0};\nthreshold = 1*^-6;\n\npoints = discretize[domain, n, \"Grid\"];"
+], "Input"],
+
+Cell[BoxData[
+"kernelBuilders = {\n  {\"Linear\",          gramLinear},\n  {\"Polynomial d=2\",  gramPolynomial[1, 2]},\n  {\"Polynomial d=5\",  gramPolynomial[1, 5]},\n  {\"Gaussian s=1.0\",  gramGaussian[1.0]},\n  {\"Gaussian s=0.1\",  gramGaussian[0.1]},\n  {\"Gaussian s=0.01\", gramGaussian[0.01]}\n};"
+], "Input"],
+
+Cell[BoxData[
+"results = Table[\n  Module[{name, builder, G, dim, eigs, nonzero, lambdaMin},\n    {name, builder} = row;\n    G       = builder[points];\n    {dim, eigs} = effectiveDimension[G, threshold, True];\n    nonzero = Select[eigs, # > threshold * First[eigs] &];\n    lambdaMin = If[nonzero =!= {}, Last[nonzero], 0.0];\n    {name, dim, First[eigs], lambdaMin}\n  ],\n  {row, kernelBuilders}\n];"
+], "Input"],
+
+Cell[BoxData[
+"TableForm[results,\n  TableHeadings -> {\n    None,\n    {\"Kernel\", \"Effective dim\", \"\\[Lambda]max\", \"\\[Lambda]min (non-zero)\"}\n  }\n]"
+], "Input"]
+
+}, WindowSize -> {900, 800},
+   WindowMargins -> {{Automatic, Automatic}, {Automatic, Automatic}},
+   StyleDefinitions -> "Default.nb"
+]
