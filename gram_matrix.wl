@@ -2,17 +2,37 @@
    Gram matrix effective dimension — Wolfram Language implementation.
    Run with: math -script gram_matrix.wl
    Or open in Mathematica and evaluate all cells.
+
+   Optimized: kernel matrices are built via vectorized numerical operations
+   (DistanceMatrix, tensor dot products) instead of element-wise Outer calls.
 *)
 
-(* ── Kernels ──────────────────────────────────────────────────────────── *)
+(* ── Helpers ──────────────────────────────────────────────────────────── *)
 
-linearKernel[x_, y_] := x . y
+(* Ensure points are a numerical 2D matrix: (N, d) *)
+toMatrix[pts_] := If[VectorQ[pts, NumericQ], List /@ N[pts], N[pts]]
 
-polynomialKernel[c_, d_][x_, y_] := (x . y + c)^d
 
-gaussianKernel[sigma_][x_, y_] := Exp[-(x - y) . (x - y) / (2 sigma^2)]
+(* ── Vectorized Gram matrix builders ─────────────────────────────────── *)
+(* Each function takes a list of points and returns the full N x N matrix
+   using bulk numerical operations — no element-wise kernel calls.         *)
 
-laplacianKernel[sigma_][x_, y_] := Exp[-Total[Abs[x - y]] / sigma]
+gramLinear[pts_] :=
+  Module[{p = toMatrix[pts]}, p . Transpose[p]]
+
+gramPolynomial[c_, d_][pts_] :=
+  Module[{p = toMatrix[pts]}, (p . Transpose[p] + c)^d]
+
+gramGaussian[sigma_][pts_] :=
+  Exp[-DistanceMatrix[toMatrix[pts]]^2 / (2. sigma^2)]
+
+gramLaplacian[sigma_][pts_] :=
+  Exp[-DistanceMatrix[toMatrix[pts],
+        DistanceFunction -> ManhattanDistance] / sigma]
+
+(* For a custom scalar kernel f[x,y]: falls back to Outer, still numerical *)
+gramCustom[kernel_][pts_] :=
+  N[Outer[kernel, pts, pts, 1]]
 
 
 (* ── Discretize domain ────────────────────────────────────────────────── *)
@@ -21,19 +41,20 @@ laplacianKernel[sigma_][x_, y_] := Exp[-Total[Abs[x - y]] / sigma]
    nD: domain = {{a1,b1},{a2,b2},...}
    method: "Grid" or "Random" *)
 
-discretize[domain:{_?NumericQ, _?NumericQ}, nPoints_Integer, method_:"Grid"] :=
+discretize[domain : {_?NumericQ, _?NumericQ}, nPoints_Integer,
+           method_ : "Grid"] :=
   discretize[{domain}, nPoints, method]
 
-discretize[domain:{{_?NumericQ, _?NumericQ}..}, nPoints_Integer, method_:"Grid"] :=
+discretize[domain : {{_?NumericQ, _?NumericQ} ..}, nPoints_Integer,
+           method_ : "Grid"] :=
   Module[{axes, tuples},
     Switch[method,
       "Grid",
-        axes = Table[Subdivide[d[[1]], d[[2]], nPoints - 1], {d, domain}];
+        axes = Table[N @ Subdivide[d[[1]], d[[2]], nPoints - 1], {d, domain}];
         tuples = Tuples[axes];
         If[Length[domain] == 1, Flatten[tuples], tuples],
       "Random",
-        Transpose[Table[
-          RandomReal[{d[[1]], d[[2]]}, nPoints], {d, domain}]],
+        Transpose[Table[RandomReal[{d[[1]], d[[2]]}, nPoints], {d, domain}]],
       _, Message[discretize::badmethod, method]; $Failed
     ]
   ]
@@ -41,21 +62,17 @@ discretize[domain:{{_?NumericQ, _?NumericQ}..}, nPoints_Integer, method_:"Grid"]
 discretize::badmethod = "Unknown method `1`. Use \"Grid\" or \"Random\".";
 
 
-(* ── Build Gram matrix ────────────────────────────────────────────────── *)
-
-buildGramMatrix[kernel_, points_List] :=
-  Outer[kernel, points, points, 1]
-
-
 (* ── Effective dimension ──────────────────────────────────────────────── *)
 
 (* threshold: cutoff value
    relative -> True:  cutoff = threshold * lambda_max
-   relative -> False: cutoff = threshold (absolute) *)
+   relative -> False: cutoff = threshold (absolute)
+   Returns {effectiveDim, eigenvalues (descending)}                        *)
 
-effectiveDimension[G_?MatrixQ, threshold_:1*^-6, relative_:True] :=
+effectiveDimension[G_?MatrixQ, threshold_ : 1*^-6, relative_ : True] :=
   Module[{eigs, cutoff},
-    eigs = Sort[Eigenvalues[N[G]], Greater];   (* descending *)
+    (* eigvalsh equivalent: symmetric matrix, real eigenvalues *)
+    eigs = Sort[Eigenvalues[N[G]], Greater];
     cutoff = If[relative, threshold * First[eigs], threshold];
     {Count[eigs, e_ /; e > cutoff], eigs}
   ]
@@ -63,34 +80,35 @@ effectiveDimension[G_?MatrixQ, threshold_:1*^-6, relative_:True] :=
 
 (* ── Example ──────────────────────────────────────────────────────────── *)
 
-n = 50;
-domain = {0.0, 1.0};
+n         = 50;
+domain    = {0.0, 1.0};
 threshold = 1*^-6;
 
 points = discretize[domain, n, "Grid"];
 
-kernels = {
-  {"Linear",           linearKernel},
-  {"Polynomial d=2",   polynomialKernel[1, 2]},
-  {"Polynomial d=5",   polynomialKernel[1, 5]},
-  {"Gaussian \[Sigma]=1.0",  gaussianKernel[1.0]},
-  {"Gaussian \[Sigma]=0.1",  gaussianKernel[0.1]},
-  {"Gaussian \[Sigma]=0.01", gaussianKernel[0.01]}
+(* Each entry: {display name, vectorized gram-matrix builder} *)
+kernelBuilders = {
+  {"Linear",              gramLinear},
+  {"Polynomial d=2",      gramPolynomial[1, 2]},
+  {"Polynomial d=5",      gramPolynomial[1, 5]},
+  {"Gaussian \[Sigma]=1.0",   gramGaussian[1.0]},
+  {"Gaussian \[Sigma]=0.1",   gramGaussian[0.1]},
+  {"Gaussian \[Sigma]=0.01",  gramGaussian[0.01]}
 };
 
 results = Table[
-  Module[{name, kernel, G, dim, eigs, nonzero, lambdaMin},
-    {name, kernel} = row;
-    G = buildGramMatrix[kernel, points];
+  Module[{name, builder, G, dim, eigs, nonzero, lambdaMin},
+    {name, builder} = row;
+    G       = builder[points];
     {dim, eigs} = effectiveDimension[G, threshold, True];
     nonzero = Select[eigs, # > threshold * First[eigs] &];
     lambdaMin = If[nonzero =!= {}, Last[nonzero], 0.0];
     {name, dim, First[eigs], lambdaMin}
   ],
-  {row, kernels}
+  {row, kernelBuilders}
 ];
 
-(* Print table *)
+(* Print results table *)
 Print[""];
 Print[StringForm["`` ``  ``  ``",
   StringPadRight["Kernel", 22],
@@ -104,7 +122,7 @@ Scan[
       StringPadRight[row[[1]], 22],
       StringPadLeft[ToString[row[[2]]], 14],
       StringPadLeft[ToString[NumberForm[row[[3]], {6, 4}]], 12],
-      StringPadLeft[ScientificForm[row[[4]], 3], 20]]]
+      StringPadLeft[ToString[ScientificForm[row[[4]], 3]], 20]]]
   ],
   results
 ];
